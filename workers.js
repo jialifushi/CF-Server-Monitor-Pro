@@ -1,3 +1,216 @@
+// ==========================================
+// 通用工具函数与告警/播报模块 (Bark & Telegram)
+// ==========================================
+const formatDuration = (ms) => {
+  if (!ms || ms <= 0) return '0秒';
+  const sec = Math.floor(ms / 1000);
+  const days = Math.floor(sec / 86400);
+  const hours = Math.floor((sec % 86400) / 3600);
+  const minutes = Math.floor((sec % 3600) / 60);
+  const seconds = sec % 60;
+  let str = '';
+  if (days > 0) str += `${days}天`;
+  if (hours > 0 || days > 0) str += `${hours}小时`;
+  if (minutes > 0 || hours > 0 || days > 0) str += `${minutes}分钟`;
+  if (days === 0 && hours === 0) str += `${seconds}秒`;
+  return str;
+};
+
+const formatUptimeText = (uptime) => {
+  if (!uptime || uptime === '-' || uptime === 'Unknown') return '未知';
+  return uptime.replace(/days?/g, '天').trim();
+};
+
+const sendTelegramMsg = async (sys, msg) => {
+  if (sys.tg_notify !== 'true' || !sys.tg_bot_token || !sys.tg_chat_id) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: sys.tg_chat_id, text: msg, parse_mode: 'HTML' })
+    });
+  } catch (e) {}
+};
+
+const sendBarkMsg = async (s, title, body, extra = {}) => {
+  if (s.bark_enable !== 'true' || !s.bark_key) return { success: false, message: 'Bark未开启或未配置设备Key' };
+  let server = (s.bark_server || 'https://api.day.app').trim();
+  let key = s.bark_key.trim();
+
+  if (server.includes('://')) {
+    const parts = server.split('/');
+    if (parts.length > 3 && !key) {
+      key = parts.pop();
+      server = parts.join('/');
+    }
+  }
+  server = server.replace(/\/+$/, '');
+  if (!server.startsWith('http://') && !server.startsWith('https://')) {
+    server = 'https://' + server;
+  }
+  key = key.replace(/^\/+/, '').replace(/\/+$/, '');
+
+  const endpoint = `${server}/${key}`;
+  const payload = {
+    title: title,
+    body: body,
+    group: extra.group || s.bark_group || 'HertzMonitor',
+    badge: 1,
+    ...extra
+  };
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && (data.code === 200 || data.message === 'success' || !data.code)) {
+      return { success: true, data };
+    }
+    return { success: false, message: data.message || `HTTP ${res.status}` };
+  } catch (e) {
+    return { success: false, message: e.message || '网络请求失败' };
+  }
+};
+
+const checkAlertsAndReports = async (env, sys) => {
+  try {
+    const { results: allServers } = await env.DB.prepare('SELECT id, name, uptime, last_updated FROM servers').all();
+    if (!allServers || allServers.length === 0) return;
+
+    const now = Date.now();
+    const alertThresMs = parseInt(sys.alert_threshold || '120') * 1000;
+
+    // 1. Telegram 离线/恢复通知 (保留并向下兼容原有机制)
+    if (sys.tg_notify === 'true' && sys.tg_bot_token && sys.tg_chat_id) {
+      let alertState = {};
+      const stateRes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
+      if (stateRes) {
+        try { alertState = JSON.parse(stateRes.value); } catch(e) {}
+      }
+      let stateChanged = false;
+      for (const s of allServers) {
+        const diff = now - s.last_updated;
+        const isOffline = diff > alertThresMs;
+        if (isOffline && !alertState[s.id]) {
+          await sendTelegramMsg(sys, `⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+          alertState[s.id] = true;
+          stateChanged = true;
+        } else if (!isOffline && alertState[s.id]) {
+          await sendTelegramMsg(sys, `✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+          delete alertState[s.id];
+          stateChanged = true;
+        }
+      }
+      if (stateChanged) {
+        await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(alertState)).run();
+      }
+    }
+
+    // 2. Bark 离线告警、阶梯递增提醒与恢复通知
+    if (sys.bark_enable === 'true' && sys.bark_key) {
+      let barkAlertState = {};
+      const barkStateRes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'bark_alert_state'").first();
+      if (barkStateRes) {
+        try { barkAlertState = JSON.parse(barkStateRes.value); } catch(e) {}
+      }
+      let barkStateChanged = false;
+
+      for (const s of allServers) {
+        const diff = now - s.last_updated;
+        const isOffline = diff > alertThresMs;
+
+        if (isOffline) {
+          const state = barkAlertState[s.id];
+          if (!state || !state.is_offline) {
+            // 初次离线立即发出通知
+            const timeStr = new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
+            const title = `⚠️ 设备离线告警: ${s.name}`;
+            const body = `服务名称: ${s.name}\n当前状态: 离线\n已离线: ${formatDuration(diff)}\n时间: ${timeStr}`;
+            await sendBarkMsg(sys, title, body, { group: '故障告警', level: 'timeSensitive' });
+            barkAlertState[s.id] = {
+              is_offline: true,
+              first_offline_time: s.last_updated || now,
+              last_alert_time: now,
+              next_alert_delay: 6 * 3600 * 1000 // 6小时后再次通知
+            };
+            barkStateChanged = true;
+          } else {
+            // 持续离线：检查是否满足成倍递增间隔 (6h -> 12h -> 24h -> 48h...)
+            const delay = state.next_alert_delay || (6 * 3600 * 1000);
+            if (now - state.last_alert_time >= delay) {
+              const totalOffline = now - (state.first_offline_time || s.last_updated);
+              const nextDelay = delay * 2;
+              const nextHours = Math.round(nextDelay / 3600000);
+              const timeStr = new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
+              const title = `🚨 设备持续离线提醒: ${s.name}`;
+              const body = `服务名称: ${s.name}\n当前状态: 持续离线\n已累计离线: ${formatDuration(totalOffline)}\n下次提醒: ${nextHours} 小时后\n时间: ${timeStr}`;
+              await sendBarkMsg(sys, title, body, { group: '故障告警' });
+              state.last_alert_time = now;
+              state.next_alert_delay = nextDelay;
+              barkStateChanged = true;
+            }
+          }
+        } else if (!isOffline && barkAlertState[s.id] && barkAlertState[s.id].is_offline) {
+          // 恢复上线通知
+          const totalOffline = now - (barkAlertState[s.id].first_offline_time || s.last_updated);
+          const timeStr = new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
+          const title = `✅ 设备恢复在线: ${s.name}`;
+          const body = `服务名称: ${s.name}\n当前状态: 在线正常\n总离线时长: ${formatDuration(totalOffline)}\n时间: ${timeStr}`;
+          await sendBarkMsg(sys, title, body, { group: '故障恢复' });
+          delete barkAlertState[s.id];
+          barkStateChanged = true;
+        }
+      }
+
+      if (barkStateChanged) {
+        await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("bark_alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(barkAlertState)).run();
+      }
+
+      // 3. Bark 每日固定时段播报 (09:00, 12:00, 18:00 北京时间)
+      if (sys.bark_daily_report !== 'false') {
+        const bjtDate = new Date(now + 8 * 3600 * 1000);
+        const y = bjtDate.getUTCFullYear();
+        const m = String(bjtDate.getUTCMonth() + 1).padStart(2, '0');
+        const d = String(bjtDate.getUTCDate()).padStart(2, '0');
+        const hour = bjtDate.getUTCHours();
+
+        if (hour === 9 || hour === 12 || hour === 18) {
+          const slotKey = `${y}-${m}-${d}_${hour}`;
+          const slotRes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'bark_last_report_slot'").first();
+          const lastSlot = slotRes ? slotRes.value : '';
+          if (lastSlot !== slotKey) {
+            let onlineCount = 0;
+            let offlineCount = 0;
+            const nodeLines = [];
+
+            for (const s of allServers) {
+              const diff = now - s.last_updated;
+              const isOff = diff > alertThresMs;
+              if (isOff) {
+                offlineCount++;
+                nodeLines.push(`❌ ${s.name}: 离线 (已离线 ${formatDuration(diff)})`);
+              } else {
+                onlineCount++;
+                const uptimeStr = formatUptimeText(s.uptime);
+                nodeLines.push(`✅ ${s.name}: 在线正常 (成功在线 ${uptimeStr})`);
+              }
+            }
+
+            const slotLabel = hour === 9 ? '早间播报 (09:00)' : (hour === 12 ? '午间播报 (12:00)' : '晚间播报 (18:00)');
+            const title = `📊 服务状态${slotLabel}`;
+            const body = `设备总数: ${allServers.length} 台 (在线: ${onlineCount} | 离线: ${offlineCount})\n\n` + nodeLines.join('\n');
+            await sendBarkMsg(sys, title, body, { group: '日常播报' });
+
+            await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("bark_last_report_slot", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(slotKey).run();
+          }
+        }
+      }
+    }
+  } catch(e) {}
+};
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -91,6 +304,7 @@ export default {
       admin_path: '/admin', asset_currency: '元', seed_nodes: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
       auto_reset_traffic: 'false', report_interval: '5', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
       offline_threshold: '30', alert_threshold: '120',
+      bark_enable: 'false', bark_server: '', bark_key: '', bark_group: 'HertzMonitor', bark_daily_report: 'true',
       enable_popup: 'false', popup_content: '<h3>📢 公告</h3><p>欢迎来到 Server Monitor Pro！<br>这是自定义弹窗内容，支持 HTML 排版。</p>'
     };
 
@@ -101,6 +315,9 @@ export default {
 
     if (!sys.admin_path) sys.admin_path = '/admin';
     if (!sys.admin_path.startsWith('/')) sys.admin_path = '/' + sys.admin_path;
+
+    if (env.BARK_SERVER && !sys.bark_server) sys.bark_server = env.BARK_SERVER;
+    if (env.BARK_KEY && !sys.bark_key) sys.bark_key = env.BARK_KEY;
 
     let cachedNodes = null; let availableThemes = [];
     try { 
@@ -143,41 +360,11 @@ export default {
     };
 
     const sendTelegram = async (msg) => {
-      if (sys.tg_notify !== 'true' || !sys.tg_bot_token || !sys.tg_chat_id) return;
-      try {
-        await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/sendMessage`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: sys.tg_chat_id, text: msg, parse_mode: 'HTML' })
-        });
-      } catch (e) {}
+      await sendTelegramMsg(sys, msg);
     };
 
     const checkOfflineNodes = async () => {
-      if (sys.tg_notify !== 'true') return;
-      try {
-        const { results: allServers } = await env.DB.prepare('SELECT id, name, last_updated FROM servers').all();
-        let alertState = {};
-        const stateRes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
-        if (stateRes) alertState = JSON.parse(stateRes.value);
-
-        let stateChanged = false;
-        const now = Date.now();
-        const alertThresMs = parseInt(sys.alert_threshold || '120') * 1000;
-
-        for (const s of allServers) {
-          const diff = now - s.last_updated;
-          const isOffline = diff > alertThresMs; 
-
-          if (isOffline && !alertState[s.id]) {
-            await sendTelegram(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
-            alertState[s.id] = true; stateChanged = true;
-          } else if (!isOffline && alertState[s.id]) {
-            await sendTelegram(`✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
-            delete alertState[s.id]; stateChanged = true;
-          }
-        }
-        if (stateChanged) await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(alertState)).run();
-      } catch (e) {}
+      await checkAlertsAndReports(env, sys);
     };
 
     const getFooterHtml = (sys) => `
@@ -551,6 +738,29 @@ export default {
       if (!checkAuth(request)) return authResponse(sys.admin_title);
       try {
         const data = await request.json();
+        if (data.action === 'test_bark') {
+          let testServer = (data.server || sys.bark_server || 'https://api.day.app').trim();
+          let testKey = (data.key || sys.bark_key || '').trim();
+          if (!testKey) {
+            return new Response(JSON.stringify({ success: false, message: '设备 Key 不能为空' }), {
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+          const testSys = {
+            bark_enable: 'true',
+            bark_server: testServer,
+            bark_key: testKey,
+            bark_group: data.group || sys.bark_group || 'HertzMonitor'
+          };
+          const timeStr = new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
+          const testResult = await sendBarkMsg(testSys, '🔔 Bark 推送测试', `恭喜！这是一条来自 Hertz server monitor 的测试通知。\n测试时间: ${timeStr}`, {
+            group: testSys.bark_group,
+            level: 'timeSensitive'
+          });
+          return new Response(JSON.stringify(testResult), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
         if (data.action === 'save_settings') {
           for (const [k, v] of Object.entries(data.settings)) {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
@@ -816,6 +1026,39 @@ export default {
               <div class="form-group"><label>Chat ID</label><input type="text" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}" placeholder="如: 123456789"></div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #0284c7;">🔔 Bark 配置</label>
+              <p style="font-size: 12px; color: #666; margin-top: -5px; margin-bottom: 10px;">支持自建 Bark 服务或官方服务推送。支持设备离线即时告警、阶梯递增提醒，以及每日 9:00、12:00、18:00 定时状态播报。</p>
+              <div class="form-group">
+                <label>开启状态</label>
+                <select id="cfg_bark_enable">
+                  <option value="false" ${sys.bark_enable !== 'true' ? 'selected' : ''}>关闭 Bark 推送</option>
+                  <option value="true" ${sys.bark_enable === 'true' ? 'selected' : ''}>开启 Bark 推送</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>服务器地址</label>
+                <input type="text" id="cfg_bark_server" value="${sys.bark_server || ''}" placeholder="如: https://api.day.app 或 自建服务器地址">
+              </div>
+              <div class="form-group">
+                <label>设备Key</label>
+                <input type="text" id="cfg_bark_key" value="${sys.bark_key || ''}" placeholder="填入 Bark App 中的设备 Key">
+              </div>
+              <div class="form-group">
+                <label>分组名称 (Group)</label>
+                <input type="text" id="cfg_bark_group" value="${sys.bark_group || 'HertzMonitor'}" placeholder="默认: HertzMonitor">
+              </div>
+              <div class="form-group">
+                <label>每日固定播报</label>
+                <select id="cfg_bark_daily_report">
+                  <option value="true" ${sys.bark_daily_report !== 'false' ? 'selected' : ''}>开启 (每天 09:00、12:00、18:00 播报服务状态)</option>
+                  <option value="false" ${sys.bark_daily_report === 'false' ? 'selected' : ''}>关闭每日固定播报</option>
+                </select>
+              </div>
+              <div style="margin-top: 6px; margin-bottom: 15px; display: flex; justify-content: flex-end;">
+                <button type="button" onclick="testBarkNotification(event)" class="btn" style="background:#4b5563;color:#fff;padding:7px 18px;font-size:13px;border-radius:4px;border:none;cursor:pointer;">测试通知</button>
+              </div>
+
+              <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
               <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #8b5cf6;">📡 三网延迟测试节点选择 (动态下发更新)</label>
               <div class="form-group"><label>电信 (CT) 测速节点</label><select id="cfg_ping_node_ct">${buildOpts(pingOpts.ct, sys.ping_node_ct)}</select></div>
               <div class="form-group"><label>联通 (CU) 测速节点</label><select id="cfg_ping_node_cu">${buildOpts(pingOpts.cu, sys.ping_node_cu)}</select></div>
@@ -939,6 +1182,11 @@ export default {
                 tg_notify: document.getElementById('cfg_tg_notify').value,
                 tg_bot_token: document.getElementById('cfg_tg_bot_token').value,
                 tg_chat_id: document.getElementById('cfg_tg_chat_id').value,
+                bark_enable: document.getElementById('cfg_bark_enable').value,
+                bark_server: document.getElementById('cfg_bark_server').value.trim(),
+                bark_key: document.getElementById('cfg_bark_key').value.trim(),
+                bark_group: document.getElementById('cfg_bark_group').value.trim() || 'HertzMonitor',
+                bark_daily_report: document.getElementById('cfg_bark_daily_report').value,
                 report_interval: document.getElementById('cfg_report_interval').value || '5',
                 offline_threshold: document.getElementById('cfg_offline_threshold').value || '30',
                 alert_threshold: document.getElementById('cfg_alert_threshold').value || '120',
@@ -955,6 +1203,42 @@ export default {
               const newPath = document.getElementById('cfg_admin_path').value || '/admin';
               window.location.href = newPath.startsWith('/') ? newPath : '/' + newPath; 
             } else alert('保存失败');
+          }
+          async function testBarkNotification(e) {
+            const server = document.getElementById('cfg_bark_server').value.trim();
+            const key = document.getElementById('cfg_bark_key').value.trim();
+            const group = document.getElementById('cfg_bark_group').value.trim();
+            if (!key) {
+              alert('请先输入 Bark 设备Key！');
+              return;
+            }
+            const btn = e.target;
+            const originalText = btn.innerText;
+            btn.innerText = '发送中...';
+            btn.disabled = true;
+            try {
+              const res = await fetch('${sys.admin_path}/api', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  action: 'test_bark',
+                  server: server,
+                  key: key,
+                  group: group
+                })
+              });
+              const result = await res.json();
+              if (result.success) {
+                alert('✅ 测试通知发送成功！请检查手机 Bark App。');
+              } else {
+                alert('❌ 发送失败：' + (result.message || '未知错误'));
+              }
+            } catch (err) {
+              alert('❌ 请求异常：' + err.message);
+            } finally {
+              btn.innerText = originalText;
+              btn.disabled = false;
+            }
           }
           async function addServer() {
             const name = document.getElementById('newName').value;
@@ -2610,5 +2894,21 @@ rm -f /tmp/cf_install.sh
     }
 
     return new Response('Not Found', { status: 404 });
+  },
+  async scheduled(event, env, ctx) {
+    let sys = {
+      site_title: 'Hertz server monitor', admin_title: '⚙️ 探针管理后台',
+      alert_threshold: '120', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
+      bark_enable: 'false', bark_server: '', bark_key: '', bark_group: 'HertzMonitor', bark_daily_report: 'true'
+    };
+    try {
+      const { results } = await env.DB.prepare('SELECT * FROM settings').all();
+      if (results && results.length > 0) results.forEach(r => sys[r.key] = r.value);
+    } catch (e) {}
+
+    if (env.BARK_SERVER && !sys.bark_server) sys.bark_server = env.BARK_SERVER;
+    if (env.BARK_KEY && !sys.bark_key) sys.bark_key = env.BARK_KEY;
+
+    await checkAlertsAndReports(env, sys);
   }
 };
