@@ -85,7 +85,7 @@ export default {
     });
 
     let sys = {
-      site_title: '⚡ Server Monitor Pro', admin_title: '⚙️ 探针管理后台', theme: 'theme1', 
+      site_title: 'Hertz server monitor', admin_title: '⚙️ 探针管理后台', theme: 'theme1', 
       custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
       is_public: 'true', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true', show_admin_btn: 'true',
       admin_path: '/admin', asset_currency: '元', seed_nodes: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
