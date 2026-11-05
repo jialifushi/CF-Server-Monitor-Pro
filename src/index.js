@@ -305,6 +305,7 @@ export default {
       auto_reset_traffic: 'false', report_interval: '5', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
       offline_threshold: '30', alert_threshold: '120',
       bark_enable: 'false', bark_server: '', bark_key: '', bark_group: 'HertzMonitor', bark_daily_report: 'true',
+      footer_text: '🔋 只要服务器不爆炸，监控就不放假 | 💓 保持在线，持续心跳',
       enable_popup: 'false', popup_content: '<h3>📢 公告</h3><p>欢迎来到 Server Monitor Pro！<br>这是自定义弹窗内容，支持 HTML 排版。</p>'
     };
 
@@ -368,13 +369,16 @@ export default {
     };
 
     const getFooterHtml = (sys) => `
-      <div style="text-align: center; margin-top: 40px; padding-bottom: 20px; font-size: 13px; color: inherit; opacity: 0.8;">
+      <div style="text-align: center; margin-top: 40px; padding-bottom: 20px; font-size: 13px; color: inherit; opacity: 0.85;">
         <div style="margin-bottom: 8px;">
             <span style="margin-right: 15px;">👁️ 历史总访问：<b style="color: #3b82f6;">${sys.visits_total || 0}</b> 次</span>
             <span>🔥 今日访问：<b style="color: #10b981;">${sys.visits_today || 0}</b> 次</span>
         </div>
-        Powered by <a href="https://github.com/a63414262/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro (Gossip Edition)</a> | 
-        <a href="https://www.youtube.com/@%E7%A7%91%E6%8A%80KKK" target="_blank" style="color: #ef4444; text-decoration: none; font-weight: 600;">▶️ 小K分享频道</a>
+        <div>
+            <span>🚀 <b>${sys.site_title || 'Hertz server monitor'}</b></span>
+            <span style="margin: 0 8px; opacity: 0.5;">|</span>
+            <span>${sys.footer_text || '🔋 只要服务器不爆炸，监控就不放假 | 💓 保持在线，持续心跳'}</span>
+        </div>
       </div>
     `;
 
@@ -956,6 +960,10 @@ export default {
                 <input type="text" id="cfg_admin_title" value="${sys.admin_title}">
               </div>
               <div class="form-group">
+                <label>页脚趣味标语 (替换原引流广告)</label>
+                <input type="text" id="cfg_footer_text" value="${sys.footer_text || '🔋 只要服务器不爆炸，监控就不放假 | 💓 保持在线，持续心跳'}">
+              </div>
+              <div class="form-group">
                 <label>⏱️ Agent 上报间隔 (秒)</label>
                 <input type="number" id="cfg_report_interval" value="${sys.report_interval || '5'}" min="1" max="120" placeholder="默认 5 秒">
               </div>
@@ -1169,6 +1177,7 @@ export default {
                 custom_script: document.getElementById('cfg_custom_script').value,
                 site_title: document.getElementById('cfg_site_title').value,
                 admin_title: document.getElementById('cfg_admin_title').value,
+                footer_text: document.getElementById('cfg_footer_text').value,
                 is_public: document.getElementById('cfg_is_public').checked ? 'true' : 'false',
                 auto_reset_traffic: document.getElementById('cfg_auto_reset_traffic').checked ? 'true' : 'false',
                 show_price: document.getElementById('cfg_show_price').checked ? 'true' : 'false',
